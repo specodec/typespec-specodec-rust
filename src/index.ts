@@ -95,12 +95,12 @@ function writeExpr(t: Type, expr: string): string {
   if (isArrayType(t)) {
     const elem = arrayElementType(t);
     const lenExpr = expr.startsWith("&") ? expr.substring(1) : expr;
-    return `w.begin_array(${lenExpr}.len()); for _e in ${expr} { w.next_element(); ${writeExpr(elem, "_e")} }; w.end_array()`;
+    return `w.begin_array(${lenExpr}.len()); for elem in ${expr} { w.next_element(); ${writeExpr(elem, "elem")} }; w.end_array()`;
   }
   if (isRecordType(t)) {
     const elem = recordElementType(t);
     const lenExpr = expr.startsWith("&") ? expr.substring(1) : expr;
-    return `w.begin_object(${lenExpr}.len()); for (_k, _v) in ${expr} { w.write_field(_k); ${writeExpr(elem, "_v")} }; w.end_object()`;
+    return `w.begin_object(${lenExpr}.len()); for (key, val) in ${expr} { w.write_field(key); ${writeExpr(elem, "val")} }; w.end_object()`;
   }
   if (t.kind === "Model" && (t as Model).name) return `${toSnakeCase((t as Model).name)}_write(${expr}, w)`;
   return `w.write_string(${expr})`;
@@ -128,14 +128,14 @@ function readExpr(t: Type, optional?: boolean, boxed?: boolean): string {
       if (isArrayType(t)) {
         const elem = arrayElementType(t);
         const rt = typeToRust(elem);
-        const arrExpr = `{ let mut _arr: Vec<${rt}> = Vec::new(); r.begin_array()?; while r.has_next_element()? { _arr.push(${readExpr(elem, false, false)}); } r.end_array()?; _arr }`;
+        const arrExpr = `{ let mut arr: Vec<${rt}> = Vec::new(); r.begin_array()?; while r.has_next_element()? { arr.push(${readExpr(elem, false, false)}); } r.end_array()?; arr }`;
         if (optional) return `Some(${arrExpr})`;
         return arrExpr;
       }
       if (isRecordType(t)) {
         const elem = recordElementType(t);
         const rt = typeToRust(elem);
-        const mapExpr = `{ let mut _map: std::collections::HashMap<String, ${rt}> = std::collections::HashMap::new(); r.begin_object()?; while r.has_next_field()? { let _k = r.read_field_name()?; _map.insert(_k, ${readExpr(elem, false, false)}); } r.end_object()?; _map }`;
+        const mapExpr = `{ let mut map: std::collections::HashMap<String, ${rt}> = std::collections::HashMap::new(); r.begin_object()?; while r.has_next_field()? { let key = r.read_field_name()?; map.insert(key, ${readExpr(elem, false, false)}); } r.end_object()?; map }`;
         if (optional) return `Some(${mapExpr})`;
         return mapExpr;
       }
@@ -174,22 +174,25 @@ export async function $onEmit(context: EmitContext<EmitterOptions>) {
       lines.push(`#[derive(Debug, Clone, Default)]`);
       lines.push(`pub struct ${m.name} {`);
       for (const f of fields) {
-        lines.push(`    pub ${f.name}: ${typeToRustField(f.type, f.optional, m.name)},`);
+        const fSnake = toSnakeCase(f.name);
+        lines.push(`    pub ${fSnake}: ${typeToRustField(f.type, f.optional, m.name)},`);
       }
       lines.push(`}`);
       lines.push("");
 
       lines.push(`pub fn ${snakeName}_write(obj: &${m.name}, w: &mut dyn SpecWriter) {`);
-      lines.push(`    let mut _n: usize = ${reqCount};`);
+      lines.push(`    let mut field_count: usize = ${reqCount};`);
       for (const f of fields.filter(f => f.optional)) {
-        lines.push(`    if obj.${f.name}.is_some() { _n += 1; }`);
+        const fSnake = toSnakeCase(f.name);
+        lines.push(`    if obj.${fSnake}.is_some() { field_count += 1; }`);
       }
-      lines.push(`    w.begin_object(_n);`);
+      lines.push(`    w.begin_object(field_count);`);
       for (const f of fields) {
+        const fSnake = toSnakeCase(f.name);
         if (f.optional) {
-          lines.push(`    if let Some(ref _v) = obj.${f.name} { w.write_field("${f.name}"); ${writeExpr(f.type, "_v")}; }`);
+          lines.push(`    if let Some(ref _v) = obj.${fSnake} { w.write_field("${f.name}"); ${writeExpr(f.type, "_v")}; }`);
         } else {
-          lines.push(`    w.write_field("${f.name}"); ${writeExpr(f.type, `&obj.${f.name}`)};`);
+          lines.push(`    w.write_field("${f.name}"); ${writeExpr(f.type, `&obj.${fSnake}`)};`);
         }
       }
       lines.push(`    w.end_object();`);
@@ -198,28 +201,30 @@ export async function $onEmit(context: EmitContext<EmitterOptions>) {
 
       lines.push(`pub fn ${snakeName}_decode(r: &mut dyn SpecReader) -> Result<${m.name}, SCodecError> {`);
       for (const f of fields) {
+        const fSnake = toSnakeCase(f.name);
         const rt = typeToRust(f.type);
         const boxed = needsBox(f.type, m.name);
         if (f.optional) {
-          lines.push(`    let mut _${f.name}: ${boxed ? `Option<Box<${rt}>>` : `Option<${rt}>`} = None;`);
+          lines.push(`    let mut _${fSnake}: ${boxed ? `Option<Box<${rt}>>` : `Option<${rt}>`} = None;`);
         } else {
           const varType = boxed ? `Box<${rt}>` : rt;
           const defVal = boxed ? `Box::new(${defaultFor(f.type)})` : defaultFor(f.type);
-          lines.push(`    let mut _${f.name}: ${varType} = ${defVal};`);
+          lines.push(`    let mut _${fSnake}: ${varType} = ${defVal};`);
         }
       }
       lines.push(`    r.begin_object()?;`);
       lines.push(`    while r.has_next_field()? {`);
       lines.push(`        match r.read_field_name()?.as_str() {`);
       for (const f of fields) {
+        const fSnake = toSnakeCase(f.name);
         const boxed = needsBox(f.type, m.name);
-        lines.push(`            "${f.name}" => { _${f.name} = ${readExpr(f.type, f.optional, boxed)}; }`);
+        lines.push(`            "${f.name}" => { _${fSnake} = ${readExpr(f.type, f.optional, boxed)}; }`);
       }
       lines.push(`            _ => { r.skip()?; }`);
       lines.push(`        }`);
       lines.push(`    }`);
       lines.push(`    r.end_object()?;`);
-      lines.push(`    Ok(${m.name} { ${fields.map(f => `${f.name}: _${f.name}`).join(", ")} })`);
+      lines.push(`    Ok(${m.name} { ${fields.map(f => `${toSnakeCase(f.name)}: _${toSnakeCase(f.name)}`).join(", ")} })`);
       lines.push(`}`);
       lines.push("");
 
